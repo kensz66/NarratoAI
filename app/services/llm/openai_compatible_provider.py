@@ -51,6 +51,11 @@ def validate_openai_compatible_base_url(base_url: Optional[str]) -> Optional[str
         normalized = _validate_openai_compatible_base_url_value(base_url)
     except ValueError as exc:
         raise ConfigurationError(str(exc), "base_url") from exc
+
+    # 核心逻辑：如果是本地地址，直接放行，不再产生警告
+    if normalized and ("localhost" in normalized or "127.0.0.1" in normalized):
+        return normalized
+
     warning = openai_compatible_base_url_warning(normalized)
     if warning:
         logger.warning(warning)

@@ -95,6 +95,10 @@ def openai_compatible_base_url_warning(base_url: Optional[str]) -> str:
 
     parsed = urlparse(normalized)
     host = (parsed.hostname or "").rstrip(".").lower()
+
+    if host and ( host in ["localhost" ,"127.0.0.1"]):
+        return ""
+
     return OPENAI_COMPATIBLE_BASE_URL_WARNING.format(host=host)
 
 

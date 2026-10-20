@@ -255,62 +255,17 @@ def _apply_sonilo_sfx(task_id: str, params: VideoClipParams, combined_video_path
 
 
 def _transcribe_final_video(task_id: str, video_path: str, params: VideoClipParams) -> str:
-    """Transcribe the fully merged video into an SRT file."""
     from app.services import fun_asr_subtitle
+    import os
 
-    if not video_path or not path.exists(video_path):
-        raise FileNotFoundError(f"自动转录视频不存在: {video_path}")
-
-    backend = _get_auto_transcription_backend(params)
-    subtitle_file = path.join(utils.task_dir(task_id), "auto_transcribed_final.srt")
-    logger.info(f"开始自动转录最终视频: {video_path}, backend={backend}")
-
-    if backend == "local":
-        api_url = str(
-            getattr(params, "subtitle_auto_transcribe_api_url", "")
-            or config.fun_asr.get("api_url", fun_asr_subtitle.LOCAL_FUN_ASR_API_URL)
-        ).strip()
-        if not api_url:
-            raise ValueError("请先输入本地 FunASR-Pack API 地址")
-
-        generated_path = fun_asr_subtitle.create_with_local_fun_asr(
-            local_file=video_path,
-            subtitle_file=subtitle_file,
-            api_url=api_url,
-            hotword=str(getattr(params, "subtitle_auto_transcribe_hotword", "") or "").strip(),
-            enable_spk=bool(getattr(params, "subtitle_auto_transcribe_enable_spk", False)),
-        )
-    elif backend == "firered":
-        api_url = str(
-            getattr(params, "subtitle_auto_transcribe_firered_api_url", "")
-            or config.fun_asr.get("firered_api_url", fun_asr_subtitle.LOCAL_FIRERED_ASR_API_URL)
-        ).strip()
-        if not api_url:
-            raise ValueError("请先输入本地ASR API 地址")
-
-        generated_path = fun_asr_subtitle.create_with_local_firered_asr(
-            local_file=video_path,
-            subtitle_file=subtitle_file,
-            api_url=api_url,
-        )
-    else:
-        api_key = str(
-            getattr(params, "subtitle_auto_transcribe_api_key", "")
-            or config.fun_asr.get("api_key", "")
-        ).strip()
-        if not api_key:
-            raise ValueError("请先输入阿里百炼 API Key")
-
-        generated_path = fun_asr_subtitle.create_with_fun_asr(
-            local_file=video_path,
-            subtitle_file=subtitle_file,
-            api_key=api_key,
-        )
-
-    if not generated_path or not path.exists(generated_path):
-        raise RuntimeError("自动转录失败：未生成字幕文件")
-
-    logger.info(f"自动转录字幕生成成功: {generated_path}")
+    subtitle_file = os.path.join(utils.task_dir(task_id), "auto_transcribed_final.srt")
+    
+    # 直接强制调用本地 Whisper
+    generated_path = fun_asr_subtitle._run_local_whisper_direct(
+        local_file=video_path,
+        subtitle_file=subtitle_file,
+        model_path="/home/ken/data/youdub/submodule/models/whisper-large-v3"
+    )
     return generated_path
 
 

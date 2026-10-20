@@ -893,7 +893,6 @@ def create_with_local_fun_asr(
     except Exception as exc:
         raise FunAsrError("本地 FunASR-Pack 字幕转写失败，请检查服务地址、文件或模型状态") from exc
 
-
 def create_with_local_firered_asr(
     local_file: str,
     subtitle_file: str = "",
@@ -905,43 +904,11 @@ def create_with_local_firered_asr(
     timeout: float = 600.0,
     session=requests,
 ) -> Optional[str]:
-    """Create an SRT file through a locally running FireRedASR2-AED-Pack API."""
-    service_name = "本地 FireRedASR2-AED-Pack 服务"
-    try:
-        result_json = request_local_firered_asr(
-            local_file=local_file,
-            api_url=api_url,
-            enable_vad=enable_vad,
-            enable_lid=enable_lid,
-            enable_punc=enable_punc,
-            return_timestamp=return_timestamp,
-            timeout=timeout,
-            session=session,
-        )
-
-        srt_file = result_json.get("srt_file")
-        if isinstance(srt_file, str) and srt_file and os.path.isfile(srt_file):
-            output_file = copy_srt_file(srt_file, subtitle_file)
-        else:
-            download_url = _get_local_srt_download_url(result_json)
-            if download_url:
-                output_file = download_local_srt(
-                    download_url,
-                    api_url=api_url,
-                    subtitle_file=subtitle_file,
-                    session=session,
-                    service_name=service_name,
-                )
-            else:
-                srt_content = firered_asr_result_to_srt(result_json)
-                output_file = write_srt_file(srt_content, subtitle_file)
-
-        logger.info(f"本地 FireRedASR2-AED-Pack 字幕文件已生成: {output_file}")
-        return output_file
-    except FunAsrError:
-        raise
-    except Exception as exc:
-        raise FunAsrError("本地ASR字幕转写失败，请检查 FireRedASR2-AED-Pack 服务地址、文件或模型状态") from exc
+    """
+    【已被劫持】原本是调用本地 FireRedASR，现在直接转为调用本地 Whisper
+    """
+    logger.info("🚀 拦截到 FireRedASR 请求，已切换为本地 Whisper-large-v3 直接处理")
+    return _run_local_whisper_direct(local_file, subtitle_file)
 
 
 def create_with_fun_asr(
@@ -976,3 +943,278 @@ def create_with_fun_asr(
         raise
     except Exception as exc:
         raise FunAsrError("Fun-ASR 字幕转写失败，请检查文件、网络或阿里百炼服务状态") from exc
+
+
+def _run_local_whisper_direct(
+    local_file: str,
+    subtitle_file: str = "",
+    model_path: str = "/home/ken/data/youdub/submodule/models/whisper-large-v3",
+) -> Optional[str]:
+    """
+    【满分神作】基于 wtpsplit 高斯长度约束的语义切分 + 毫秒级时间戳回填
+    """
+    from faster_whisper import WhisperModel
+    import gc
+    import os
+    import time
+    import json
+    import hashlib
+    import re
+    from loguru import logger
+    import opencc
+
+    sat_model = None
+    def _get_sat_model():
+        nonlocal sat_model
+        if sat_model is None:
+            from wtpsplit import SaT
+            # 使用纯 ONNX 版本
+            sat_model = SaT("sat-3l-sm", ort_providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+        return sat_model
+
+    def _smart_join(words_list):
+        text = ""
+        for w in words_list:
+            word_str = w["word"] if isinstance(w, dict) else w
+            if not text:
+                text = word_str
+                continue
+            
+            prev_word_clean = text.strip().split(" ")[-1].strip(",.?!").lower()
+            curr_word_clean = word_str.strip().strip(",.?!").lower()
+            if prev_word_clean == curr_word_clean and prev_word_clean not in {"no", "yeah", "yes", "oh", "well"}:
+                continue
+                
+            prev_char = text[-1]
+            curr_char = word_str[0]
+            
+            if curr_char in {'.', ',', '?', '!', '。', '，', '？', '！', ';', '；', ':', '：', "'", '"'}:
+                text += word_str
+            elif re.match(r'[\u4e00-\u9fa5]', prev_char) or re.match(r'[\u4e00-\u9fa5]', curr_char):
+                if text.endswith(" "): text = text[:-1]
+                text += word_str
+            else:
+                if word_str.startswith(" ") or text.endswith(" "):
+                    text += word_str
+                else:
+                    text += " " + word_str
+        return re.sub(r'\s+', ' ', text).strip()
+
+    # 计算文本中中文字符比例
+    def _get_chinese_ratio(text):
+        if not text: return 0.0
+        total = len(text.replace(" ", ""))
+        if total == 0: return 0.0
+        ch_chars = len(re.findall(r'[\u4e00-\u9fa5]', text))
+        return ch_chars / total
+
+    if not subtitle_file:
+        subtitle_file = os.path.join(utils.subtitle_dir(), f"whisper_{int(time.time())}.srt")
+    
+    output_file = subtitle_file
+    audio_basename = os.path.basename(local_file)
+    try:
+        audio_size = os.path.getsize(local_file)
+    except OSError:
+        audio_size = 0
+    
+    file_fingerprint = hashlib.md5(f"{audio_basename}_{audio_size}".encode('utf-8')).hexdigest()[:8]
+    cache_dir = os.path.join(utils.subtitle_dir(), "whisper_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    json_file_path = os.path.join(cache_dir, f"{file_fingerprint}_asr_word_level.json")
+
+    all_words = []
+    whisper_model = None
+
+    try:
+        # 1. 读取缓存或执行转录
+        if os.path.exists(json_file_path):
+            logger.info(f"♻️ 读取缓存: {json_file_path}")
+            with open(json_file_path, "r", encoding="utf-8") as f:
+                all_words = json.load(f)
+        else:
+            logger.info(f"⏳ 加载 Whisper 模型: {model_path}")
+            whisper_model = WhisperModel(model_path, device="cuda", compute_type="float16")
+            segments, info = whisper_model.transcribe(
+                local_file, beam_size=5, word_timestamps=True, language=None,
+                initial_prompt="This is an interview. Please transcribe accurately.",
+                vad_filter=True, condition_on_previous_text=False
+            )
+            for segment in segments:
+                if not segment.words: continue
+                for word in segment.words:
+                    if not word.word.strip(): continue
+                    all_words.append({
+                        "word": word.word, "start": word.start, "end": word.end,
+                        "probability": getattr(word, "probability", 1.0)
+                    })
+            with open(json_file_path, "w", encoding="utf-8") as f:
+                json.dump(all_words, f, ensure_ascii=False, indent=2)
+
+        all_words.sort(key=lambda x: x["start"])
+        
+        # ==========================================
+        # 2. 物理预切分：把全篇切成“段落级”大块（防模型输入过长）
+        # ==========================================
+        logger.info("🔪 第一层：物理预切分为大段落...")
+        paragraphs = []
+        current_para = []
+        for w in all_words:
+            current_para.append(w)
+            # 遇到句号，或者超过 15 秒，强制切成一个大段落
+            if w["word"].strip()[-1:] in {'.', '?', '!', '。', '？', '！'} or (current_para[-1]["end"] - current_para[0]["start"]) > 15.0:
+                paragraphs.append(current_para)
+                current_para = []
+        if current_para:
+            paragraphs.append(current_para)
+
+        # ==========================================
+        # 3. 第二层：利用 wtpsplit 的高斯长度约束进行语义细分
+        # ==========================================
+        logger.info("🧠 第二层：wtpsplit 语义细分配置...")
+        semantic_blocks = []
+        model = _get_sat_model()
+
+        for para in paragraphs:
+            para_text = _smart_join(para)
+            if not para_text.strip(): continue
+
+            cn_ratio = _get_chinese_ratio(para_text)
+            # 动态配置高斯先验：中文目标 15 字，英文目标 25 字符
+            if cn_ratio > 0.3:
+                target_len, max_len = 15, 22
+            else:
+                target_len, max_len = 25, 42
+
+            # 调用 wtpsplit 长度约束（源码明确说明：传了约束后，内部会做 Viterbi 寻优）
+            try:
+                sentences = model.split(
+                    para_text, 
+                    max_length=max_len, 
+                    prior_type="gaussian", 
+                    prior_kwargs={"target_length": target_len}
+                )
+            except Exception as e:
+                logger.warning(f"wtpsplit 失败，降级为物理切分: {e}")
+                sentences = [para_text] # 降级处理
+
+            # ==========================================
+            # 4. 毫秒级时间戳回填（按字符顺序严格匹配）
+            # ==========================================
+            word_idx = 0
+            for sent in sentences:
+                sent = sent.strip()
+                if not sent: continue
+                
+                # 源码注释：使用约束时，句子内部可能包含换行，拼接使用 "".join()
+                # 这里为了匹配，我们直接把 sent 里的所有空白去掉，用纯字符匹配
+                sent_clean = re.sub(r'\s+', '', sent)
+                if not sent_clean: continue
+                
+                sub_words = []
+                char_consumed = 0
+                
+                # 遍历当前大段落的词，直到字符数匹配上
+                while word_idx < len(para) and char_consumed < len(sent_clean):
+                    w = para[word_idx]
+                    sub_words.append(w)
+                    # 累加去掉空白的字符数
+                    char_consumed += len(re.sub(r'\s+', '', w["word"]))
+                    word_idx += 1
+                
+                if sub_words:
+                    semantic_blocks.append({
+                        "start": sub_words[0]["start"] * 1000,
+                        "end": sub_words[-1]["end"] * 1000,
+                        "text": _smart_join(sub_words), 
+                        "words": sub_words
+                    })
+
+        # ==========================================
+        # 5. 安全兜底与极致抛光
+        # ==========================================
+        logger.info("🪄 第三层：悬空词迁移与碎片合并...")
+        HANGING_WORDS = {"the", "a", "an", "of", "to", "in", "for", "on", "at", "by", "with", "and", "or", "but", "that"}
+        
+        # 5.1 悬空词迁移（同样需要严格防重叠）
+        for i in range(len(semantic_blocks) - 1):
+            words_in_block = semantic_blocks[i]["words"]
+            if not words_in_block: continue
+            
+            # 如果本身就带着强标点，不要迁移
+            if words_in_block[-1]["word"].strip()[-1:] in {'.', '?', '!', '。', '？', '！'}:
+                continue
+                
+            while len(words_in_block) > 1:
+                last_word = words_in_block[-1]["word"].strip().lower()
+                last_word_clean = re.sub(r'[^\w\s]', '', last_word).strip()
+                if last_word_clean in HANGING_WORDS:
+                    hanging_word = words_in_block.pop()
+                    
+                    semantic_blocks[i]["text"] = _smart_join(words_in_block)
+                    semantic_blocks[i]["end"] = words_in_block[-1]["end"] * 1000
+                    
+                    semantic_blocks[i+1]["words"].insert(0, hanging_word)
+                    semantic_blocks[i+1]["start"] = max(
+                        semantic_blocks[i+1]["start"],
+                        semantic_blocks[i]["end"] + 10,
+                        hanging_word["start"] * 1000
+                    )
+                    semantic_blocks[i+1]["text"] = _smart_join(semantic_blocks[i+1]["words"])
+                else:
+                    break
+
+        # 5.2 极短碎片安全合并（严禁超 3.5 秒）
+        final_blocks = []
+        for block in semantic_blocks:
+            duration = block["end"] - block["start"]
+            if duration < 800 and final_blocks:
+                merged_duration = block["end"] - final_blocks[-1]["start"]
+                if merged_duration <= 3500: 
+                    prev_text = final_blocks[-1]["text"]
+                    curr_text = block["text"]
+                    
+                    if curr_text[0] in {'.', ',', '?', '!', '。', '，', '？', '！'}:
+                        final_blocks[-1]["text"] = prev_text + curr_text
+                    elif re.match(r'[\u4e00-\u9fa5]', prev_text[-1]) and re.match(r'[\u4e00-\u9fa5]', curr_text[0]):
+                        final_blocks[-1]["text"] = prev_text + curr_text
+                    else:
+                        final_blocks[-1]["text"] = prev_text + " " + curr_text
+                        
+                    final_blocks[-1]["end"] = block["end"]
+                    continue
+            final_blocks.append(block)
+
+        # ==========================================
+        # 6. 生成 SRT
+        # ==========================================
+        lines = []
+        for index, block in enumerate(final_blocks, start=1):
+            lines.append(_srt_block(index, block["start"], block["end"], block["text"]))
+        srt_content = "\n".join(lines).rstrip() + "\n"
+
+        try:
+            cc = opencc.OpenCC('t2s')
+            srt_content = cc.convert(srt_content)
+        except Exception:
+            pass
+
+        output_file = write_srt_file(srt_content, output_file)
+        logger.info(f"✅ 生成成功，共 {len(final_blocks)} 条: {output_file}")
+        return output_file
+
+    except Exception as e:
+        logger.error(f"❌ 失败: {e}")
+        raise FunAsrError(f"失败: {e}")
+
+    finally:
+        if whisper_model is not None: del whisper_model
+        if sat_model is not None: del sat_model
+        gc.collect()
+        try:
+            import torch
+            if torch.cuda.is_available(): torch.cuda.empty_cache()
+        except ImportError: pass
+
+
+
