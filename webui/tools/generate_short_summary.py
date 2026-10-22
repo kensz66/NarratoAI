@@ -22,7 +22,7 @@ from app.services.SDE.short_drama_explanation import (
     match_narration_copy_to_script as match_narration_copy_to_script_legacy,
 )
 from app.services.subtitle_text import read_subtitle_text
-from app.services.short_drama_narration_validation import (
+from app.services.narration_validation import (
     normalize_script_video_sources,
 )
 from app.services.tavily_search import TavilySearchError, format_search_context, search_story_context

@@ -1161,7 +1161,7 @@ def render_fun_asr_transcription(tr):
     def clear_fun_asr_subtitle_state():
         _set_subtitle_state([])
 
-    from app.services import fun_asr_subtitle
+    from app.services import transcribe
 
     backend_options = {
         tr("Local FunASR-Pack API"): "local",
@@ -1181,8 +1181,8 @@ def render_fun_asr_transcription(tr):
     backend_labels = list(backend_options.keys())
     backend = saved_backend
     api_key = ""
-    api_url = config.fun_asr.get("api_url", fun_asr_subtitle.LOCAL_FUN_ASR_API_URL)
-    firered_api_url = config.fun_asr.get("firered_api_url", fun_asr_subtitle.LOCAL_FIRERED_ASR_API_URL)
+    api_url = config.fun_asr.get("api_url", transcribe.LOCAL_FUN_ASR_API_URL)
+    firered_api_url = config.fun_asr.get("firered_api_url", transcribe.LOCAL_FIRERED_ASR_API_URL)
     hotword = config.fun_asr.get("hotword", "")
     enable_spk = bool(config.fun_asr.get("enable_spk", False))
     media_paths = _selected_video_paths()
@@ -1489,7 +1489,7 @@ def render_fun_asr_transcription(tr):
                 subtitle_path = _unique_file_path(utils.subtitle_dir(), subtitle_name)
 
                 if backend == "local":
-                    generated_path = fun_asr_subtitle.create_with_local_fun_asr(
+                    generated_path = transcribe.create_with_local_fun_asr(
                         local_file=media_path,
                         subtitle_file=subtitle_path,
                         api_url=str(api_url).strip(),
@@ -1497,13 +1497,13 @@ def render_fun_asr_transcription(tr):
                         enable_spk=bool(enable_spk),
                     )
                 elif backend == "firered":
-                    generated_path = fun_asr_subtitle.create_with_local_firered_asr(
+                    generated_path = transcribe.create_with_local_firered_asr(
                         local_file=media_path,
                         subtitle_file=subtitle_path,
                         api_url=str(firered_api_url).strip(),
                     )
                 else:
-                    generated_path = fun_asr_subtitle.create_with_fun_asr(
+                    generated_path = transcribe.create_with_fun_asr(
                         local_file=media_path,
                         subtitle_file=subtitle_path,
                         api_key=api_key.strip(),

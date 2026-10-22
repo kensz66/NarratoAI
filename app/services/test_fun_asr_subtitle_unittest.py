@@ -8,7 +8,7 @@ except ModuleNotFoundError:  # Python < 3.11
     import tomli as tomllib
 
 from app.config import config as cfg
-from app.services import fun_asr_subtitle as fasr
+from app.services import transcribe as fasr
 
 
 class FakeResponse:

@@ -499,7 +499,7 @@ def _get_saved_auto_transcribe_backend():
 
 def render_auto_transcription_settings(tr):
     """渲染最终视频自动转录设置。"""
-    from app.services import fun_asr_subtitle
+    from app.services import transcribe
 
     auto_transcribe_enabled = st.checkbox(
         tr("Enable Auto Transcription"),
@@ -511,8 +511,8 @@ def render_auto_transcription_settings(tr):
     config.fun_asr["auto_transcribe_enabled"] = auto_transcribe_enabled
 
     backend = _get_saved_auto_transcribe_backend()
-    api_url = config.fun_asr.get("api_url", fun_asr_subtitle.LOCAL_FUN_ASR_API_URL)
-    firered_api_url = config.fun_asr.get("firered_api_url", fun_asr_subtitle.LOCAL_FIRERED_ASR_API_URL)
+    api_url = config.fun_asr.get("api_url", transcribe.LOCAL_FUN_ASR_API_URL)
+    firered_api_url = config.fun_asr.get("firered_api_url", transcribe.LOCAL_FIRERED_ASR_API_URL)
     hotword = config.fun_asr.get("hotword", "")
     enable_spk = bool(config.fun_asr.get("enable_spk", False))
     api_key = config.fun_asr.get("api_key", "")

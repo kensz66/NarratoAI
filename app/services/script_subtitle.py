@@ -5,46 +5,88 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
-from app.services.short_drama_narration_validation import build_subtitle_index
+from app.services.narration_validation import build_subtitle_index
 from app.services.subtitle_text import read_subtitle_text
 from app.utils import utils
 
 
 DEFAULT_SUBTITLE_OST_TYPES = (0, 2)
 DEFAULT_ORIGINAL_SUBTITLE_OST_TYPES = (1,)
-DEFAULT_MAX_CHARS_PER_SUBTITLE = 12
-SENTENCE_PART_RE = re.compile(r"[^。！？!?；;，,、\n]+[。！？!?；;，,、]?")
+
+# 中文：16 字/行；英文：42 字符/行（约 8-10 词）
+DEFAULT_MAX_CHARS_CJK = 16
+DEFAULT_MAX_CHARS_EN = 42
+
+# 语速常量（与 narration_validation.py 保持一致）
+CHARS_PER_SECOND_CJK = 5.0
+WORDS_PER_SECOND_EN = 2.5
+
+SENTENCE_PART_RE = re.compile(
+    r"[^。！？!?；;，,、.\n]+[。！？!?；;，,、.]?"
+)
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+
 SubtitleEntry = Tuple[float, float, str]
+
+
+def _is_mostly_cjk(text: str) -> bool:
+    text = str(text or "")
+    if not text.strip():
+        return True
+    zh = len(_CJK_RE.findall(text))
+    ascii_alpha = sum(1 for c in text if c.isascii() and c.isalpha())
+    return zh >= ascii_alpha or zh >= 8
 
 
 def _normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", str(text or "")).strip()
 
 
-def _remove_punctuation(text: str) -> str:
+def _remove_cjk_punctuation(text: str) -> str:
+    """移除中文标点，保留英文标点（英文标点是阅读节奏的一部分）。"""
     return "".join(
         char for char in str(text or "")
-        if not unicodedata.category(char).startswith("P")
+        if not (unicodedata.category(char).startswith("P")
+                and unicodedata.east_asian_width(char) in ("W", "F"))
     )
 
 
 def clean_subtitle_text(text: str) -> str:
-    """Normalize subtitle text for burn-in display."""
-    return _normalize_text(_remove_punctuation(text))
+    return _normalize_text(_remove_cjk_punctuation(text))
 
 
-def split_narration(text: str, max_chars: int = DEFAULT_MAX_CHARS_PER_SUBTITLE) -> List[str]:
-    """Split narration into readable subtitle chunks."""
-    text = _normalize_text(text)
-    if not text:
+def _split_english_words(text: str, max_chars: int) -> List[str]:
+    """英文按单词边界切分，不切断单词。"""
+    words = text.split()
+    if not words:
         return []
 
-    max_chars = max(1, int(max_chars or DEFAULT_MAX_CHARS_PER_SUBTITLE))
+    chunks: List[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}" if current else word
+        if len(candidate) <= max_chars:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            while len(word) > max_chars:
+                chunks.append(word[:max_chars])
+                word = word[max_chars:]
+            current = word
+    if current:
+        chunks.append(current)
+    return [c.strip() for c in chunks if c.strip()]
+
+
+def _split_cjk(text: str, max_chars: int) -> List[str]:
+    """中文按字符 + 标点切分。"""
     parts = [match.group(0).strip() for match in SENTENCE_PART_RE.finditer(text)]
     if not parts:
         parts = [text]
 
-    chunks = []
+    chunks: List[str] = []
     current = ""
 
     def flush_long_part(part: str) -> str:
@@ -56,7 +98,6 @@ def split_narration(text: str, max_chars: int = DEFAULT_MAX_CHARS_PER_SUBTITLE) 
     for part in parts:
         if not part:
             continue
-
         if len(part) > max_chars:
             if current:
                 chunks.append(current.strip())
@@ -78,12 +119,34 @@ def split_narration(text: str, max_chars: int = DEFAULT_MAX_CHARS_PER_SUBTITLE) 
     return [cleaned for chunk in chunks if (cleaned := clean_subtitle_text(chunk))]
 
 
+def split_narration(text: str, max_chars: Optional[int] = None) -> List[str]:
+    """按语言分别切分解说。中文 16 字/行，英文 42 字符/行。"""
+    text = _normalize_text(text)
+    if not text:
+        return []
+
+    if _is_mostly_cjk(text):
+        return _split_cjk(text, max_chars or DEFAULT_MAX_CHARS_CJK)
+    return _split_english_words(clean_subtitle_text(text), max_chars or DEFAULT_MAX_CHARS_EN)
+
+
+def estimate_reading_seconds(text: str) -> float:
+    """按语言估算阅读时长（用于按比例分配字幕时间）。"""
+    text = str(text or "")
+    if not text.strip():
+        return 0.0
+    if _is_mostly_cjk(text):
+        n = sum(1 for c in text if not c.isspace())
+        return n / CHARS_PER_SECOND_CJK
+    words = len(_WORD_RE.findall(text))
+    return words / WORDS_PER_SECOND_EN if words > 0 else 0.0
+
+
 def parse_srt_like_time(time_text: str) -> float:
     time_text = str(time_text or "").strip().replace(",", ".")
     parts = time_text.split(":")
     if len(parts) != 3:
         raise ValueError(f"不支持的时间格式: {time_text}")
-
     hours = int(parts[0])
     minutes = int(parts[1])
     seconds = float(parts[2])
@@ -93,13 +156,11 @@ def parse_srt_like_time(time_text: str) -> float:
 def parse_time_range(time_range: str) -> Tuple[float, float]:
     if not time_range or "-" not in str(time_range):
         raise ValueError(f"不支持的时间范围: {time_range}")
-
     start_text, end_text = str(time_range).split("-", 1)
     start = parse_srt_like_time(start_text)
     end = parse_srt_like_time(end_text)
     if end <= start:
         raise ValueError(f"结束时间必须晚于开始时间: {time_range}")
-
     return start, end
 
 
@@ -133,7 +194,6 @@ def _normalize_paths(paths) -> List[str]:
         paths = [paths]
     if not paths:
         return []
-
     normalized_paths = []
     seen = set()
     for item in paths:
@@ -151,7 +211,6 @@ def _resolve_script_video_id(item: dict, video_origin_paths: Sequence[str]) -> i
     video_id = _coerce_positive_int(item.get("video_id") or item.get("video_index"))
     if video_id is not None:
         return video_id
-
     video_name = os.path.basename(
         str(item.get("video_name") or item.get("source_video") or "").strip()
     )
@@ -159,7 +218,6 @@ def _resolve_script_video_id(item: dict, video_origin_paths: Sequence[str]) -> i
         for index, video_path in enumerate(video_origin_paths, start=1):
             if os.path.basename(video_path) == video_name:
                 return index
-
     return 1
 
 
@@ -178,17 +236,14 @@ def _build_combined_original_subtitle_content(
     subtitle_paths = _normalize_paths(original_subtitle_paths)
     video_paths = _normalize_paths(video_origin_paths)
     sections = []
-
     for index, subtitle_path in enumerate(subtitle_paths, start=1):
         if not os.path.exists(subtitle_path):
             logger.warning(f"原片字幕文件不存在，跳过: {subtitle_path}")
             continue
-
         content = _read_subtitle_file(subtitle_path)
         if not content:
             logger.warning(f"原片字幕文件为空，跳过: {subtitle_path}")
             continue
-
         video_path = video_paths[index - 1] if index <= len(video_paths) else ""
         if video_path:
             header = (
@@ -198,7 +253,6 @@ def _build_combined_original_subtitle_content(
         else:
             header = f"# 视频 {index}\n字幕文件: {os.path.basename(subtitle_path)}"
         sections.append(f"{header}\n{content}".strip())
-
     return "\n\n".join(sections)
 
 
@@ -208,7 +262,6 @@ def _resolve_item_time_range(item: dict, current_time: float) -> Tuple[Optional[
         start = current_time
         end = current_time + duration
         return (start, end), end
-
     edited_time_range = item.get("editedTimeRange")
     if edited_time_range:
         try:
@@ -216,14 +269,44 @@ def _resolve_item_time_range(item: dict, current_time: float) -> Tuple[Optional[
             return (start, end), end
         except ValueError as e:
             logger.warning(f"解析 editedTimeRange 失败，将尝试使用 duration: {e}")
-
     return None, current_time
+
+
+def _distribute_chunks_by_reading_time(
+    chunks: List[str],
+    start: float,
+    end: float,
+) -> List[SubtitleEntry]:
+    """按"阅读时长估算"分配每个 chunk 的时间片。
+
+    不是平均分配，而是按 chunk 的阅读时长占比分配。
+    短句时间短，长句时间长，符合观众读字幕的自然节奏。
+    """
+    segment_duration = end - start
+    if segment_duration <= 0 or not chunks:
+        return []
+
+    weights = [max(0.2, estimate_reading_seconds(c)) for c in chunks]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        return []
+
+    entries: List[SubtitleEntry] = []
+    cursor = start
+    for i, (chunk, weight) in enumerate(zip(chunks, weights)):
+        if i == len(chunks) - 1:
+            chunk_end = end
+        else:
+            chunk_end = cursor + segment_duration * (weight / total_weight)
+        entries.append((cursor, chunk_end, chunk))
+        cursor = chunk_end
+    return entries
 
 
 def _build_narration_subtitle_entries(
     list_script: Sequence[dict],
     include_ost: Iterable[int],
-    max_chars: int,
+    max_chars: Optional[int] = None,
 ) -> List[SubtitleEntry]:
     include_ost_set = {int(item) for item in include_ost}
     entries: List[SubtitleEntry] = []
@@ -233,25 +316,17 @@ def _build_narration_subtitle_entries(
         time_range, current_time = _resolve_item_time_range(item, current_time)
         if not time_range:
             continue
-
         ost = _safe_ost_value(item.get("OST"))
         if ost not in include_ost_set:
             continue
 
-        chunks = split_narration(item.get("narration", ""), max_chars=max_chars)
+        text = item.get("narration", "")
+        chunks = split_narration(text, max_chars=max_chars)
         if not chunks:
             continue
 
         start, end = time_range
-        segment_duration = end - start
-        if segment_duration <= 0:
-            continue
-
-        chunk_duration = segment_duration / len(chunks)
-        for chunk_index, chunk in enumerate(chunks):
-            chunk_start = start + chunk_duration * chunk_index
-            chunk_end = end if chunk_index == len(chunks) - 1 else start + chunk_duration * (chunk_index + 1)
-            entries.append((chunk_start, chunk_end, chunk))
+        entries.extend(_distribute_chunks_by_reading_time(chunks, start, end))
 
     return entries
 
@@ -263,8 +338,7 @@ def _build_original_subtitle_entries(
     include_ost: Iterable[int] = DEFAULT_ORIGINAL_SUBTITLE_OST_TYPES,
 ) -> List[SubtitleEntry]:
     original_subtitle_content = _build_combined_original_subtitle_content(
-        original_subtitle_paths,
-        video_origin_paths,
+        original_subtitle_paths, video_origin_paths,
     )
     if not original_subtitle_content:
         return []
@@ -287,7 +361,6 @@ def _build_original_subtitle_entries(
         time_range, current_time = _resolve_item_time_range(item, current_time)
         if not time_range:
             continue
-
         ost = _safe_ost_value(item.get("OST"))
         if ost not in include_ost_set:
             continue
@@ -337,36 +410,16 @@ def _build_original_subtitle_entries(
 
 def _subtitle_entries_to_blocks(entries: Sequence[SubtitleEntry]) -> List[str]:
     blocks = []
-    sorted_entries = sorted(
-        entries,
-        key=lambda entry: (entry[0], entry[1], entry[2]),
-    )
-
+    sorted_entries = sorted(entries, key=lambda entry: (entry[0], entry[1], entry[2]))
     for subtitle_index, (start, end, text) in enumerate(sorted_entries, start=1):
         blocks.append(
-            "\n".join(
-                [
-                    str(subtitle_index),
-                    f"{format_srt_time(start)} --> {format_srt_time(end)}",
-                    text,
-                ]
-            )
+            "\n".join([
+                str(subtitle_index),
+                f"{format_srt_time(start)} --> {format_srt_time(end)}",
+                text,
+            ])
         )
-
     return blocks
-
-
-def _build_srt_blocks(
-    list_script: Sequence[dict],
-    include_ost: Iterable[int],
-    max_chars: int,
-) -> List[str]:
-    entries = _build_narration_subtitle_entries(
-        list_script,
-        include_ost=include_ost,
-        max_chars=max_chars,
-    )
-    return _subtitle_entries_to_blocks(entries)
 
 
 def create_script_subtitle_file(
@@ -374,12 +427,15 @@ def create_script_subtitle_file(
     list_script: Sequence[dict],
     output_file: Optional[str] = None,
     include_ost: Optional[Iterable[int]] = None,
-    max_chars: int = DEFAULT_MAX_CHARS_PER_SUBTITLE,
+    max_chars: Optional[int] = None,
     original_subtitle_paths=None,
     video_origin_paths=None,
     include_original_ost: Optional[Iterable[int]] = None,
 ) -> str:
-    """Create a full SRT file from script narration plus original-audio subtitles."""
+    """Create a full SRT file from script narration plus original-audio subtitles.
+
+    max_chars=None 时按语言自动选择：中文 16 字/行，英文 42 字符/行。
+    """
     if not list_script:
         return ""
 
@@ -389,9 +445,7 @@ def create_script_subtitle_file(
         include_original_ost = DEFAULT_ORIGINAL_SUBTITLE_OST_TYPES
 
     entries = _build_narration_subtitle_entries(
-        list_script,
-        include_ost=include_ost,
-        max_chars=max_chars,
+        list_script, include_ost=include_ost, max_chars=max_chars,
     )
     entries.extend(
         _build_original_subtitle_entries(

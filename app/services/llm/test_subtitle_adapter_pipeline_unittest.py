@@ -34,30 +34,30 @@ class SubtitleAnalyzerAdapterPipelineTests(unittest.TestCase):
         self.assertNotIn("300-650", call.call_args.kwargs["prompt"])
         self.assertNotIn("response_format", call.call_args.kwargs)
 
-    def test_generate_narration_copy_can_use_film_tv_prompt_category(self):
-        self.assertTrue(PromptManager.exists("film_tv_narration", "narration_copy"))
+    def test_generate_narration_copy_can_use_podcast_interview_category(self):
+        self.assertTrue(PromptManager.exists("podcast_interview", "narration_copy"))
         adapter = SubtitleAnalyzerAdapter(
             api_key="sk-test",
             model="test-model",
             base_url="https://example.test/v1",
             provider="openai",
-            prompt_category="film_tv_narration",
+            prompt_category="podcast_interview",
         )
 
         with mock.patch.object(adapter, "_run_async_safely", return_value="他发现证据不对，真正的凶手另有其人。") as call:
             result = adapter.generate_narration_copy(
-                short_name="测试电影",
-                plot_analysis="主角发现证据疑点。",
+                short_name="测试访谈",
+                plot_analysis="嘉宾认为过早拿到钱会让创业者欺骗自己。",
                 subtitle_content="# 视频 1: 1.mp4\n00:00:01,000 --> 00:00:04,000\n证据不对。",
                 temperature=0.7,
                 narration_language="简体中文（中国）",
-                drama_genre="悬疑/犯罪",
+                drama_genre="观点/思想",
                 narration_word_count=1200,
             )
 
         self.assertEqual("success", result["status"])
-        self.assertIn("影视解说正文创作任务", call.call_args.kwargs["prompt"])
-        self.assertIn("用户选择的影视类型", call.call_args.kwargs["prompt"])
+        self.assertIn("播客访谈解说正文创作任务", call.call_args.kwargs["prompt"])
+        self.assertIn("访谈类型", call.call_args.kwargs["prompt"])
         self.assertIn("1200", call.call_args.kwargs["prompt"])
         self.assertNotIn("350-750", call.call_args.kwargs["prompt"])
         self.assertNotIn("短剧解说正文创作任务", call.call_args.kwargs["prompt"])

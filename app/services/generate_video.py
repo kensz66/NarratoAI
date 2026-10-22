@@ -1262,8 +1262,16 @@ def _build_ffmpeg_merge_command(
         *input_args,
     ]
     if filter_parts:
-        cmd.extend(["-filter_complex", ";".join(filter_parts)])
-
+        # 写 filter_complex 到临时文件，避免 Linux execve 参数长度上限
+        # 1308 条字幕的 drawtext filter 拼接后远超 128KB 单个参数上限
+        filter_script_path = os.path.join(
+            output_dir, f".filter_script_{int(time.time() * 1000)}.txt"
+        )
+        with open(filter_script_path, "w", encoding="utf-8") as f:
+            f.write(";\n".join(filter_parts))
+        temp_files.append(filter_script_path)
+        cmd.extend(["-filter_complex_script", filter_script_path])
+        
     if has_video_filter:
         encoder = _select_compatible_encoder(ffmpeg_utils.get_optimal_ffmpeg_encoder())
         cmd.extend(["-map", "[vout]", *_build_video_encoder_args(encoder, threads)])

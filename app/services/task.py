@@ -255,13 +255,13 @@ def _apply_sonilo_sfx(task_id: str, params: VideoClipParams, combined_video_path
 
 
 def _transcribe_final_video(task_id: str, video_path: str, params: VideoClipParams) -> str:
-    from app.services import fun_asr_subtitle
+    from app.services import transcribe
     import os
 
     subtitle_file = os.path.join(utils.task_dir(task_id), "auto_transcribed_final.srt")
     
     # 直接强制调用本地 Whisper
-    generated_path = fun_asr_subtitle._run_local_whisper_direct(
+    generated_path = transcribe._run_local_whisper_direct(
         local_file=video_path,
         subtitle_file=subtitle_file,
         model_path="/home/ken/data/youdub/submodule/models/whisper-large-v3"

@@ -1,6 +1,6 @@
 import unittest
 
-from app.services.short_drama_narration_validation import (
+from app.services.narration_validation import (
     build_subtitle_index,
     normalize_script_video_sources,
     validate_narration_script_items,

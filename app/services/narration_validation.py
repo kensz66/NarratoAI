@@ -1,7 +1,13 @@
 #!/usr/bin/env python
 # -*- coding: UTF-8 -*-
 
-"""Validation helpers for short drama narration scripts."""
+"""Validation helpers for narration scripts.
+
+- Structural validation (timestamps, video_id, SRT bounds): language-agnostic.
+- Narrative continuity rules (opening hook, consecutive original): profile-based.
+- Narration density (units vs. duration): language-aware (CJK chars vs. EN words),
+  with dual thresholds: warn (light overflow) vs error (catastrophic overflow).
+"""
 
 from __future__ import annotations
 
@@ -9,6 +15,8 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from loguru import logger
 
 
 TIMESTAMP_RE = re.compile(r"^\d{2}:\d{2}:\d{2},\d{3}$")
@@ -20,8 +28,53 @@ SRT_RANGE_RE = re.compile(
     r"(?P<end>\d{2}:\d{2}:\d{2}[,.]\d{3})"
 )
 VIDEO_HEADER_RE = re.compile(r"^#\s*视频\s*(?P<video_id>\d+)(?:\s*[:：]\s*(?P<video_name>.+?))?\s*$")
-NARRATION_CHARS_PER_SECOND = 5.0
-NARRATION_DURATION_TOLERANCE_SECONDS = 0.5
+
+# 解说密度常量（按语言区分）
+NARRATION_CHARS_PER_SECOND = 5.0              # CJK: characters per second
+NARRATION_WORDS_PER_SECOND = 2.5              # EN: words per second (~150 WPM，播客访谈真实语速)
+NARRATION_DURATION_TOLERANCE_SECONDS = 2.0     # 允许 TTS 语速 ±10% 的自然浮动
+
+# 解说过密双阈值：
+# - 超过 WARN_RATIO 倍 → 只记 warning，不阻断（clip 阶段按 TTS 实际时长裁剪兜底）
+# - 超过 ERROR_RATIO 倍 → 硬错误，触发 repair
+NARRATION_OVERCROWD_WARN_RATIO = 1.30
+NARRATION_OVERCROWD_ERROR_RATIO = 2.50
+
+_WORD_RE = re.compile(r"[A-Za-z0-9']+")
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+@dataclass(frozen=True)
+class NarrationValidationProfile:
+    """Narrative-level rules that vary by content type."""
+    name: str
+    require_opening_hook: bool = True
+    max_consecutive_original: int = 2
+    require_cross_video_bridge: bool = True
+
+
+NARRATION_PROFILE_SHORT_DRAMA = NarrationValidationProfile(
+    name="short_drama",
+    require_opening_hook=True,
+    max_consecutive_original=2,
+    require_cross_video_bridge=True,
+)
+
+NARRATION_PROFILE_FILM_TV = NarrationValidationProfile(
+    name="film_tv",
+    require_opening_hook=True,
+    max_consecutive_original=2,
+    require_cross_video_bridge=True,
+)
+
+NARRATION_PROFILE_PODCAST = NarrationValidationProfile(
+    name="podcast",
+    require_opening_hook=False,     # 访谈第一段是 OST=1 嘉宾原声钩子
+    max_consecutive_original=4,     # 访谈允许更长连续原声
+    require_cross_video_bridge=True,
+)
+
+DEFAULT_NARRATION_PROFILE = NARRATION_PROFILE_FILM_TV
 
 
 @dataclass(frozen=True)
@@ -44,6 +97,10 @@ class ScriptValidationResult:
 class NarrationScriptValidationError(ValueError):
     """Raised when a narration script cannot be made safe for clipping."""
 
+
+# ---------------------------------------------------------------
+# 时间戳 / SRT 解析
+# ---------------------------------------------------------------
 
 def timestamp_to_ms(timestamp: str) -> int:
     value = str(timestamp or "").strip().replace(".", ",")
@@ -166,13 +223,10 @@ def _extract_cues_from_section(video_id: int, video_name: str, section_text: str
 
 
 def build_subtitle_index(subtitle_content: str, video_paths: Optional[Iterable[str]] = None) -> List[SubtitleCue]:
-    """Build a per-video subtitle index from combined SRT text."""
     normalized_video_paths = _normalize_paths(video_paths)
     cues: List[SubtitleCue] = []
-
     for video_id, video_name, section_text in _split_subtitle_sections(subtitle_content, normalized_video_paths):
         cues.extend(_extract_cues_from_section(video_id, video_name, section_text))
-
     return cues
 
 
@@ -188,7 +242,6 @@ def _video_id_by_name(video_name: Any, video_paths: Sequence[str]) -> Optional[i
     normalized_name = os.path.basename(str(video_name or "").strip())
     if not normalized_name:
         return None
-
     for index, path in enumerate(video_paths, start=1):
         if os.path.basename(path) == normalized_name:
             return index
@@ -199,7 +252,6 @@ def normalize_script_video_sources(
     items: Sequence[Dict[str, Any]],
     video_paths: Optional[Iterable[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Normalize video_name from a valid source without inventing video_id."""
     normalized_video_paths = _normalize_paths(video_paths)
     normalized_items: List[Dict[str, Any]] = []
 
@@ -245,18 +297,73 @@ def _item_video_id(item: Dict[str, Any]) -> Optional[int]:
     return _coerce_positive_int(item.get("video_id"))
 
 
+# ---------------------------------------------------------------
+# 中英文时长估算
+# ---------------------------------------------------------------
+
+def _is_mostly_chinese(text: str) -> bool:
+    """中文字符数 >= ASCII 字母数，或中文字符 >= 8，则判为中文。"""
+    text = str(text or "")
+    if not text.strip():
+        return True
+    zh = len(_CJK_RE.findall(text))
+    ascii_alpha = sum(1 for c in text if c.isascii() and c.isalpha())
+    return zh >= ascii_alpha or zh >= 8
+
+
+def _narration_units_and_rate(text: str) -> Tuple[int, float, str]:
+    """返回 (unit_count, units_per_second, unit_label)。
+
+    中文按字符 / 5.0，英文按词 / 2.5。
+    """
+    text = str(text or "")
+    if _is_mostly_chinese(text):
+        n = sum(1 for c in text if not c.isspace())
+        return n, NARRATION_CHARS_PER_SECOND, "字"
+    n = len(_WORD_RE.findall(text))
+    return n, NARRATION_WORDS_PER_SECOND, "词"
+
+
+def estimate_narration_seconds(text: str) -> float:
+    """按中英文不同语速估算 TTS 时长。"""
+    units, rate, _ = _narration_units_and_rate(text)
+    return units / rate if rate > 0 else 0.0
+
+
 def count_narration_chars(text: str) -> int:
-    """Count visible narration characters for rough TTS/video-duration matching."""
-    return len(re.sub(r"\s+", "", str(text or "")))
+    """兼容旧 API：返回 unit 数量（中文=字符，英文=单词）。"""
+    units, _, _ = _narration_units_and_rate(text)
+    return units
 
 
-def max_narration_chars_for_duration(start_ms: int, end_ms: int) -> int:
+def max_narration_units_for_duration(
+    start_ms: int,
+    end_ms: int,
+    sample_text: str = "",
+) -> int:
+    """按 sample_text 判定语言，返回允许的最大 unit 数。"""
     duration_seconds = max(0.0, (end_ms - start_ms) / 1000)
-    return max(8, int((duration_seconds + NARRATION_DURATION_TOLERANCE_SECONDS) * NARRATION_CHARS_PER_SECOND))
+    _, rate, _ = _narration_units_and_rate(sample_text or "")
+    return max(8, int((duration_seconds + NARRATION_DURATION_TOLERANCE_SECONDS) * rate))
 
 
-def _validate_story_continuity(items: Sequence[Dict[str, Any]]) -> List[str]:
-    """Validate structural continuity rules that affect viewer comprehension."""
+def max_narration_chars_for_duration(
+    start_ms: int,
+    end_ms: int,
+    sample_text: str = "",
+) -> int:
+    """兼容旧 API。"""
+    return max_narration_units_for_duration(start_ms, end_ms, sample_text)
+
+
+# ---------------------------------------------------------------
+# 叙事连续性（profile 参数化）
+# ---------------------------------------------------------------
+
+def _validate_story_continuity(
+    items: Sequence[Dict[str, Any]],
+    profile: NarrationValidationProfile = DEFAULT_NARRATION_PROFILE,
+) -> List[str]:
     errors: List[str] = []
     consecutive_ost = 0
     previous_item: Optional[Dict[str, Any]] = None
@@ -269,13 +376,17 @@ def _validate_story_continuity(items: Sequence[Dict[str, Any]]) -> List[str]:
 
         item_id = item.get("_id", index + 1)
         ost = _item_ost(item)
-        if index == 0 and ost != 0:
+
+        if index == 0 and ost != 0 and profile.require_opening_hook:
             errors.append(f"片段 {item_id} 必须是 OST=0 解说开场钩子，不能直接播放原片")
 
         if ost == 1:
             consecutive_ost += 1
-            if consecutive_ost > 2:
-                errors.append(f"片段 {item_id} 连续原声过多，必须插入 OST=0 解说承接剧情")
+            if consecutive_ost > profile.max_consecutive_original:
+                errors.append(
+                    f"片段 {item_id} 连续原声过多（>{profile.max_consecutive_original}），"
+                    f"必须插入 OST=0 解说承接剧情"
+                )
         else:
             consecutive_ost = 0
 
@@ -283,7 +394,8 @@ def _validate_story_continuity(items: Sequence[Dict[str, Any]]) -> List[str]:
             previous_video_id = _item_video_id(previous_item)
             current_video_id = _item_video_id(item)
             if (
-                previous_video_id is not None
+                profile.require_cross_video_bridge
+                and previous_video_id is not None
                 and current_video_id is not None
                 and previous_video_id != current_video_id
                 and _item_ost(previous_item) == 1
@@ -298,12 +410,16 @@ def _validate_story_continuity(items: Sequence[Dict[str, Any]]) -> List[str]:
     return errors
 
 
+# ---------------------------------------------------------------
+# 主校验入口
+# ---------------------------------------------------------------
+
 def validate_narration_script_items(
     items: Any,
     subtitle_index: Sequence[SubtitleCue],
     video_paths: Optional[Iterable[str]] = None,
+    profile: NarrationValidationProfile = DEFAULT_NARRATION_PROFILE,
 ) -> ScriptValidationResult:
-    """Validate final narration items against subtitle/video source constraints."""
     errors: List[str] = []
     if not isinstance(items, list) or not items:
         return ScriptValidationResult(False, ["解说脚本 items 必须是非空数组"], [])
@@ -375,13 +491,26 @@ def validate_narration_script_items(
         if ost == 1 and not str(item.get("narration", "")).startswith("播放原片"):
             errors.append(f"片段 {item_id} 是原声片段，narration 必须使用“播放原片+序号”")
         if ost == 0:
-            narration_chars = count_narration_chars(item.get("narration", ""))
-            max_chars = max_narration_chars_for_duration(start_ms, end_ms)
-            if narration_chars > max_chars:
-                duration_seconds = (end_ms - start_ms) / 1000
+            narration_text = item.get("narration", "")
+            units, rate, unit_label = _narration_units_and_rate(narration_text)
+            max_units = max_narration_units_for_duration(start_ms, end_ms, narration_text)
+            duration_seconds = (end_ms - start_ms) / 1000
+            estimated = units / rate if rate > 0 else 0
+
+            if units > max_units * NARRATION_OVERCROWD_ERROR_RATIO:
+                # 灾难性溢出（超 2.5 倍）：硬错误，必须 repair
                 errors.append(
-                    f"片段 {item_id} 解说过密：{narration_chars} 字需要约 {narration_chars / NARRATION_CHARS_PER_SECOND:.1f} 秒，"
-                    f"但画面只有 {duration_seconds:.1f} 秒，建议不超过 {max_chars} 字或延长画面"
+                    f"片段 {item_id} 解说过密：{units} {unit_label}需要约 {estimated:.1f} 秒，"
+                    f"但画面只有 {duration_seconds:.1f} 秒，"
+                    f"超出 {units / max_units:.1f} 倍，必须修复"
+                )
+            elif units > max_units * NARRATION_OVERCROWD_WARN_RATIO:
+                # 轻微溢出（1.3-2.5 倍）：只记 warning，clip 阶段按 TTS 实际时长裁剪兜底
+                logger.warning(
+                    f"片段 {item_id} 轻微过密：{units} {unit_label}需要约 {estimated:.1f} 秒，"
+                    f"画面 {duration_seconds:.1f} 秒，超出 {units / max_units:.1f} 倍；"
+                    f"clip 阶段会按 TTS 实际时长裁剪，可能画面重复约 "
+                    f"{(units / max_units - 1) * duration_seconds:.1f} 秒"
                 )
 
         ranges_by_video.setdefault(video_id, []).append((start_ms, end_ms, coerced_item_id))
@@ -395,7 +524,7 @@ def validate_narration_script_items(
             if end_ms > previous_end:
                 previous_start, previous_end, previous_id = start_ms, end_ms, item_id
 
-    errors.extend(_validate_story_continuity(normalized_items))
+    errors.extend(_validate_story_continuity(normalized_items, profile=profile))
 
     return ScriptValidationResult(not errors, errors, normalized_items)
 
@@ -404,8 +533,9 @@ def require_valid_narration_script_items(
     items: Any,
     subtitle_index: Sequence[SubtitleCue],
     video_paths: Optional[Iterable[str]] = None,
+    profile: NarrationValidationProfile = DEFAULT_NARRATION_PROFILE,
 ) -> List[Dict[str, Any]]:
-    result = validate_narration_script_items(items, subtitle_index, video_paths)
+    result = validate_narration_script_items(items, subtitle_index, video_paths, profile=profile)
     if not result.valid:
         raise NarrationScriptValidationError("\n".join(result.errors))
     return result.items
@@ -415,7 +545,6 @@ def summarize_subtitle_window(
     subtitle_index: Sequence[SubtitleCue],
     max_cues_per_video: int = 80,
 ) -> str:
-    """Return compact subtitle context for a repair prompt."""
     lines: List[str] = []
     by_video: Dict[int, List[SubtitleCue]] = {}
     for cue in subtitle_index:

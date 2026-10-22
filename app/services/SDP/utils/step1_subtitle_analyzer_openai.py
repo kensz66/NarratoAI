@@ -7,7 +7,7 @@ import json
 from loguru import logger
 
 from app.services.subtitle_text import has_timecodes, normalize_subtitle_text, read_subtitle_text
-from app.services.short_drama_narration_validation import (
+from app.services.narration_validation import (
     build_subtitle_index,
     parse_script_timestamp_range,
 )
